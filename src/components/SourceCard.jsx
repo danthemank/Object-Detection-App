@@ -14,6 +14,9 @@ const SourceCard = ({ source }) => {
       <p className="text-sm text-gray-600 dark:text-gray-300 mb-3">
         {source.condition}
       </p>
+      <p className="text-sm text-gray-500 dark:text-gray-400 italic mb-2">
+        {source.comparison}
+      </p>
       <a 
         href={source.url}
         target="_blank"

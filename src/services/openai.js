@@ -1,26 +1,22 @@
-import OpenAI from 'openai';
+import { openaiClient } from './openaiClient';
 import { getConditionTemplate } from './conditionCriteria';
+import { MARKET_SOURCES, getRelevantMarketSources } from './marketSources';
+import { compressImage, createImageDescription } from '../utils/imageUtils';
 
-const apiKey = import.meta.env.VITE_OPENAI_API_KEY;
-
-if (!apiKey || apiKey === 'your-openai-api-key-here') {
-  throw new Error('OpenAI API key is not configured. Please add your API key to the .env file.');
-}
-
-const openai = new OpenAI({
-  apiKey: apiKey,
-  dangerouslyAllowBrowser: true
-});
-
-export async function detectObjects(base64Image) {
+export async function detectObjects(originalBase64Image) {
   try {
-    if (!base64Image) {
+    if (!originalBase64Image) {
       throw new Error('No image provided');
     }
 
-    // Step 1: Initial object identification and type
+    // Ensure the base64 string has the correct prefix
+    const base64WithPrefix = originalBase64Image.startsWith('data:image') 
+      ? originalBase64Image 
+      : `data:image/jpeg;base64,${originalBase64Image}`;
+
+    // Step 1: Initial object identification and type analysis
     console.log('Identifying object type...');
-    const typeResponse = await openai.chat.completions.create({
+    const typeResponse = await openaiClient.chat.completions.create({
       model: "gpt-4o",
       messages: [
         {
@@ -33,21 +29,25 @@ export async function detectObjects(base64Image) {
             { 
               type: "image_url",
               image_url: {
-                url: base64Image
+                url: base64WithPrefix
               }
             }
           ],
         },
       ],
-      max_tokens: 50,
+      max_tokens: 150
     });
+
+    if (!typeResponse?.choices?.[0]?.message?.content) {
+      throw new Error('Invalid response from type identification');
+    }
 
     const objectType = typeResponse.choices[0].message.content.toLowerCase().trim();
     const conditionTemplate = getConditionTemplate(objectType);
 
     // Step 2: Detailed identification
     console.log('Getting detailed identification...');
-    const identificationResponse = await openai.chat.completions.create({
+    const identificationResponse = await openaiClient.chat.completions.create({
       model: "gpt-4o",
       messages: [
         {
@@ -55,32 +55,46 @@ export async function detectObjects(base64Image) {
           content: [
             { 
               type: "text", 
-              text: `Provide a detailed identification of this ${objectType}. Include:
-              
-              # Object Details
-              - Exact name/title
-              - Year/series
-              - Manufacturer/publisher
-              - Special features or variants
-              - Unique identifiers
-              
-              Format using markdown with headers and bullet points.` 
+              text: `Provide a detailed identification of this object. Include:
+
+# Object Details
+- Exact name/title
+- Year/era if identifiable
+- Manufacturer/creator/brand
+- Materials/construction
+- Special features or characteristics
+- Any unique identifiers or markings
+- Size/dimensions if relevant
+
+Format using markdown with headers and bullet points.` 
             },
             { 
               type: "image_url",
               image_url: {
-                url: base64Image
+                url: base64WithPrefix
               }
             }
           ],
         },
       ],
-      max_tokens: 500,
+      max_tokens: 500
     });
+
+    if (!identificationResponse?.choices?.[0]?.message?.content) {
+      throw new Error('Failed to get identification details');
+    }
 
     // Step 3: Condition assessment
     console.log('Assessing condition...');
-    const conditionPrompt = `Analyze the condition of this ${objectType} using these criteria:
+    const conditionResponse = await openaiClient.chat.completions.create({
+      model: "gpt-4o",
+      messages: [
+        {
+          role: "user",
+          content: [
+            { 
+              type: "text", 
+              text: `Analyze the condition of this object using these criteria:
 
 # Condition Assessment Criteria
 ${conditionTemplate.criteria.map(c => `## ${c.name} (${c.points} points)
@@ -95,9 +109,30 @@ Provide a detailed markdown report with:
 
 ${conditionTemplate.grades.map(g => 
   `- ${g.grade} (${g.value}): ${g.minPoints}+ points - ${g.description}`
-).join('\n')}`;
+).join('\n')}`
+            },
+            { 
+              type: "image_url",
+              image_url: {
+                url: base64WithPrefix
+              }
+            }
+          ],
+        },
+      ],
+      max_tokens: 500
+    });
 
-    const conditionResponse = await openai.chat.completions.create({
+    if (!conditionResponse?.choices?.[0]?.message?.content) {
+      throw new Error('Failed to get condition assessment');
+    }
+
+    // Get market sources
+    const marketSources = getRelevantMarketSources(objectType);
+
+    // Step 4: Market value analysis
+    console.log('Analyzing market value...');
+    const valueResponse = await openaiClient.chat.completions.create({
       model: "gpt-4o",
       messages: [
         {
@@ -105,70 +140,63 @@ ${conditionTemplate.grades.map(g =>
           content: [
             { 
               type: "text", 
-              text: conditionPrompt
-            },
-            { 
-              type: "image_url",
-              image_url: {
-                url: base64Image
-              }
-            }
-          ],
-        },
-      ],
-      max_tokens: 500,
-    });
-
-    // Step 4: Market value analysis with sources
-    console.log('Analyzing market value...');
-    const valuePrompt = `Based on the identification and condition assessment, provide a market analysis:
+              text: `Based on the identification and condition assessment, provide a market analysis:
 
 # Market Value Analysis
 
 ## Market Sources
-Provide 3 specific sources where this item is currently listed for sale, including:
-- Source name (e.g., eBay, TCGPlayer, PSA)
-- Listed price
-- Condition description
-- URL to listing
+Using these relevant sources for this type of item:
+${marketSources.map(source => `- ${source.name} (${source.type})`).join('\n')}
 
-Format as JSON within markdown code block like this:
+First, find and provide ONLY a JSON block with REAL, CURRENT listings from these sources (no other text):
 \`\`\`json
 {
   "sources": [
     {
       "name": "Source Name",
       "value": "$XX.XX",
-      "condition": "Condition description",
-      "url": "https://example.com"
+      "condition": "Listed condition",
+      "type": "marketplace|auction|price_guide|dealer",
+      "url": "Full URL to the listing",
+      "comparison": "How this listing compares to the analyzed item (similarities/differences)"
     }
   ]
 }
 \`\`\`
 
+Then, after the JSON block, provide:
+
 ## Value Matrix
-Create a markdown table showing values for each condition grade
+Create a markdown table showing current market values for each condition grade
 
 ## Market Information
-- Current market trends
-- Notable value factors
-- Price history trends
+- Current market trends and recent sales
+- Active listing price ranges
+- Recent price history
+- Special factors affecting current value
+- Where this item is actively being sold
+- Current market demand and availability
 
 Use the following details:
 ${identificationResponse.choices[0].message.content}
 
-${conditionResponse.choices[0].message.content}`;
-
-    const valueResponse = await openai.chat.completions.create({
-      model: "gpt-4o",
-      messages: [
-        {
-          role: "user",
-          content: valuePrompt
-        }
+${conditionResponse.choices[0].message.content}`
+            },
+            { 
+              type: "image_url",
+              image_url: {
+                url: base64WithPrefix
+              }
+            }
+          ],
+        },
       ],
-      max_tokens: 500,
+      max_tokens: 1000
     });
+
+    if (!valueResponse?.choices?.[0]?.message?.content) {
+      throw new Error('Failed to get market analysis');
+    }
 
     // Extract sources from the response
     const sourcesMatch = valueResponse.choices[0].message.content.match(/```json\n([\s\S]*?)\n```/);
@@ -181,19 +209,20 @@ ${conditionResponse.choices[0].message.content}`;
       }
     }
 
-    // Extract price range for assessed condition
-    const priceResponse = await openai.chat.completions.create({
+    // Extract price range
+    const priceResponse = await openaiClient.chat.completions.create({
       model: "gpt-4o",
       messages: [
         {
           role: "user",
-          content: `Based on the market analysis below, provide only the minimum and maximum price in USD for the assessed condition as numbers separated by a comma. For example: "25.50,100.75"
+          content: `Based on the market analysis below, return ONLY two numbers separated by a comma representing the minimum and maximum price in USD for the assessed condition. For example: "25.50,100.75"
+          No other text or explanation.
 
           Analysis:
           ${valueResponse.choices[0].message.content}`
         }
       ],
-      max_tokens: 50,
+      max_tokens: 50
     });
 
     const [minPrice, maxPrice] = priceResponse.choices[0].message.content
@@ -214,6 +243,7 @@ ${conditionResponse.choices[0].message.content}`;
 
     return {
       type: objectType,
+      specificType: objectType === 'pokemon_card' ? 'Pokemon Card' : 'Collectible Item',
       identification: identificationResponse.choices[0].message.content,
       condition: {
         assessment: conditionResponse.choices[0].message.content,
@@ -221,7 +251,8 @@ ${conditionResponse.choices[0].message.content}`;
       },
       marketAnalysis: {
         sources,
-        analysis: valueResponse.choices[0].message.content.replace(/```json\n[\s\S]*?\n```/g, '') // Remove JSON block from display
+        relevantSources: marketSources,
+        analysis: valueResponse.choices[0].message.content.replace(/```json\n[\s\S]*?\n```/g, '')
       },
       value: {
         category,
@@ -232,6 +263,7 @@ ${conditionResponse.choices[0].message.content}`;
         }
       }
     };
+
   } catch (error) {
     console.error('OpenAI API error:', error);
     if (error.message.includes('API key')) {
